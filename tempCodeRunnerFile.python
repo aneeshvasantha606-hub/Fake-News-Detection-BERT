@@ -1,0 +1,125 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import ta # Library for Technical Analysis indicators
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from sklearn.metrics import mean_squared_error
+
+# --- Configuration ---
+TICKER = 'AAPL'
+START_DATE = '2015-01-01'
+END_DATE = '2024-11-15'
+TIME_STEP = 60 # Lookback window (60 trading days)
+EPOCHS = 25
+BATCH_SIZE = 32
+
+# --- 1. Data Collection and Feature Engineering ---
+print(f"1. Downloading data for {TICKER} and calculating indicators...")
+data = yf.download(TICKER, start=START_DATE, end=END_DATE)
+data.drop('Adj Close', axis=1, inplace=True)
+
+# Calculate Technical Indicators
+data['SMA_20'] = data['Close'].rolling(window=20).mean()
+data['RSI'] = ta.momentum.RSIIndicator(data['Close'], window=14).rsi()
+data['MACD'] = ta.trend.MACD(data['Close']).macd()
+
+# Select features and clean up NaN values (due to rolling windows/indicators)
+FEATURES = ['Close', 'Open', 'High', 'Low', 'Volume', 'SMA_20', 'RSI', 'MACD']
+data.dropna(inplace=True)
+data_for_model = data[FEATURES].values
+print(f"   Cleaned Dataset Shape: {data_for_model.shape}")
+
+# --- 2. Data Preprocessing and Sequence Creation ---
+print("2. Preprocessing data and creating sequences...")
+# Normalize the data
+scaler = MinMaxScaler(feature_range=(0, 1))
+scaled_data = scaler.fit_transform(data_for_model)
+
+# Function to create time-series sequences (X = 60 days of features, Y = 61st day Close price)
+def create_sequences(data, time_step):
+    X, Y = [], []
+    for i in range(len(data) - time_step):
+        X.append(data[i:(i + time_step), :])
+        Y.append(data[i + time_step, 0]) # Target is the normalized Close price (index 0)
+    return np.array(X), np.array(Y)
+
+X, y = create_sequences(scaled_data, TIME_STEP)
+
+# Split data: 80% Train, 20% Test
+train_size = int(len(X) * 0.8)
+X_train, X_test = X[:train_size], X[train_size:]
+y_train, y_test = y[:train_size], y[train_size:]
+
+print(f"   X_train sequence shape: {X_train.shape}")
+
+# --- 3. Model Training (LSTM) ---
+print("3. Building and training the LSTM model...")
+
+# Build the Sequential LSTM Model
+model = Sequential()
+# Layer 1: LSTM with 50 units, returns sequences for the next LSTM layer
+model.add(LSTM(units=50, return_sequences=True, input_shape=(TIME_STEP, X_train.shape[2])))
+model.add(Dropout(0.2))
+# Layer 2: Final LSTM layer, returns only the output for the Dense layers
+model.add(LSTM(units=50, return_sequences=False))
+model.add(Dropout(0.2))
+# Dense Layers: For mapping the LSTM output to the final prediction
+model.add(Dense(units=25))
+model.add(Dense(units=1)) # Output: 1 predicted value (next day's Close price)
+
+# Compile and Train
+model.compile(optimizer='adam', loss='mean_squared_error')
+model.fit(X_train, y_train, batch_size=BATCH_SIZE, epochs=EPOCHS, validation_data=(X_test, y_test), verbose=0)
+print("   Training Complete.")
+
+# --- 4. Evaluation and Backtesting ---
+print("4. Evaluating model performance...")
+predictions = model.predict(X_test)
+
+# Function to inverse scale the normalized values back to actual prices
+def inverse_scale(scaled_values, original_scaler, num_features):
+    dummy_array = np.zeros((len(scaled_values), num_features))
+    dummy_array[:, 0] = scaled_values.flatten()
+    return original_scaler.inverse_transform(dummy_array)[:, 0]
+
+# Inverse transform predictions and actual test values
+inverse_predictions = inverse_scale(predictions, scaler, data_for_model.shape[1])
+inverse_actual = inverse_scale(y_test, scaler, data_for_model.shape[1])
+
+# Calculate Root Mean Squared Error (RMSE)
+rmse = np.sqrt(mean_squared_error(inverse_actual, inverse_predictions))
+print(f"   Root Mean Squared Error (RMSE): **${rmse:.4f}**")
+
+# Calculate Directional Prediction Accuracy (Backtesting direction)
+actual_direction = np.sign(np.diff(inverse_actual))
+predicted_direction = np.sign(np.diff(inverse_predictions))
+correct_direction = np.sum(actual_direction == predicted_direction)
+accuracy = correct_direction / len(actual_direction)
+print(f"   Directional Prediction Accuracy: **{accuracy*100:.2f}%**")
+
+# --- 5. Visualization ---
+print("5. Generating visualization...")
+
+# Prepare data for plotting
+test_start_index = len(data) - len(X_test)
+# The index needs to start after the initial TIME_STEP days used for the first prediction
+plot_data_index = data.iloc[test_start_index + TIME_STEP:].index
+
+plot_df = pd.DataFrame({
+    'Actual Price': inverse_actual,
+    'Predicted Price': inverse_predictions
+}, index=plot_data_index)
+
+# Plotting
+plt.figure(figsize=(16, 8))
+plt.plot(plot_df['Actual Price'], label='Actual Price', color='blue', linewidth=2)
+plt.plot(plot_df['Predicted Price'], label='Predicted Price', color='red', linestyle='--', linewidth=1.5)
+plt.title(f'{TICKER} Stock Price Prediction vs. Actual (LSTM Model)')
+plt.xlabel('Date')
+plt.ylabel('Price (USD)')
+plt.legend()
+plt.grid(True, alpha=0.6)
+plt.show()
